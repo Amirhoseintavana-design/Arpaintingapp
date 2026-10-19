@@ -1,0 +1,35 @@
+{
+  "Version": 1,
+  "Pattern": [
+    {
+      "Event": {
+        "EventType": "HapticTransient",
+        "Time": 0,
+        "EventParameters": [
+          { "ParameterID": "HapticIntensity", "ParameterValue": 0.1 },
+          { "ParameterID": "HapticSharpness", "ParameterValue": 0.95 }
+        ]
+      }
+    },
+    {
+      "Event": {
+        "EventType": "HapticTransient",
+        "Time": 0.05,
+        "EventParameters": [
+          { "ParameterID": "HapticIntensity", "ParameterValue": 0.8 },
+          { "ParameterID": "HapticSharpness", "ParameterValue": 0.85 }
+        ]
+      }
+    },
+    {
+      "Event": {
+        "EventType": "AudioCustom",
+        "Time": 0,
+        "EventParameters": [
+          { "ParameterID": "AudioVolume", "ParameterValue": 1.0 }
+        ],
+        "EventWaveformPath": "metal_hit.wav"
+      }
+    }
+  ]
+}
