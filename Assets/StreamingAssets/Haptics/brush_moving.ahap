@@ -1,0 +1,26 @@
+{
+  "Version": 1.0,
+  "Metadata": {
+    "Project": "Haptic AR spray app",
+    "Description": "Feel of the MOVING brush: one soft continuous vibration (loops). Only felt while the brush moves: strength = Brush Base Speed Boost x hand speed (+ Brush Base Intensity, 0 = nothing when still). Intensity 1.0 here = shape only. Sharpness 0 here; Brush Base Sharpness is ADDED."
+  },
+  "Pattern": [
+    {
+      "Event": {
+        "Time": 0.0,
+        "EventType": "HapticContinuous",
+        "EventDuration": 10.0,
+        "EventParameters": [
+          {
+            "ParameterID": "HapticIntensity",
+            "ParameterValue": 1.0
+          },
+          {
+            "ParameterID": "HapticSharpness",
+            "ParameterValue": 0.0
+          }
+        ]
+      }
+    }
+  ]
+}

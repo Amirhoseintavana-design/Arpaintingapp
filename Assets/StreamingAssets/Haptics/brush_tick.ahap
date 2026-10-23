@@ -1,0 +1,25 @@
+{
+  "Version": 1.0,
+  "Metadata": {
+    "Project": "Haptic AR spray app",
+    "Description": "ONE bristle tick. The app plays this at every imaginary bump the brush passes (random gaps, from the movement). Each tick: intensity x random(Brush Grain Intensity Min..Max); random(Brush Grain Sharpness Min..Max) is ADDED to the sharpness. You may add more events (e.g. a tiny second tap) - keep the whole tick shorter than ~0.02 s."
+  },
+  "Pattern": [
+    {
+      "Event": {
+        "Time": 0.0,
+        "EventType": "HapticTransient",
+        "EventParameters": [
+          {
+            "ParameterID": "HapticIntensity",
+            "ParameterValue": 1.0
+          },
+          {
+            "ParameterID": "HapticSharpness",
+            "ParameterValue": 0.0
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "Version": 1,
+  "Pattern": [
+    {
+      "Event": {
+        "EventType": "HapticContinuous",
+        "Time": 0.0,
+        "EventDuration": 1.0,
+        "EventParameters": [
+          { "ParameterID": "HapticIntensity", "ParameterValue": 0.4 },
+          { "ParameterID": "HapticSharpness", "ParameterValue": 0.1 }
+        ]
+      }
+    }
+  ]
+}
