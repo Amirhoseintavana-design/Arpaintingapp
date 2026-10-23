@@ -1,280 +1,256 @@
-using System.Collections.Generic;
-using UnityEngine;
-using UnityEngine.EventSystems;
-using UnityEngine.InputSystem;
-using UnityEngine.XR.ARFoundation;
+// SprayPainter.cs
+// Paints onto REAL surfaces scanned by LiDAR, like a brush/marker.
+// • Aims through your cursor image (or a fixed screen position if there is none).
+// • While the screen is touched and the surface is within range, it draws a
+//   continuous line of paint dots (all the same size) on the real surface.
+// • With the Eraser selected, touching removes paint under the cursor.
 
-// Paints round dots on any surface with a collider (LiDAR mesh or test cube).
-// Hold a finger anywhere on screen (or the left mouse button in the Editor) to paint.
-// Touches on UI buttons are ignored, so no full-screen touch area is needed.
+using System.Collections.Generic;   // List and Dictionary
+using UnityEngine;
+
 public class SprayPainter : MonoBehaviour
 {
-    [Header("References")]
-    public Camera arCamera;          // leave empty = uses Main Camera
-    public Material paintMaterial;   // URP/Unlit, Surface Type: Transparent
+    // ── References (drag these in) ──────────────────────────────────────────
+    [Header("References (drag these in)")]
+    [Tooltip("The AR camera: XR Origin > Camera Offset > Main Camera")]
+    public Camera arCamera;
 
-    [Header("Brush")]
-    public Color paintColor = Color.red;
-    public float brushSize = 0.03f;      // dot diameter in metres (always the same)
-    public float eraserSize = 0.08f;     // eraser diameter in metres
-    public float maxDistance = 1.0f;     // painting range in metres (CHANGED: was 1.5) — the haptic follows this automatically
-    public float dotSpacing = 0.008f;    // gap between dots in a stroke
-    public float maxStrokeGap = 0.3f;    // bigger jump than this = new stroke (no line through the air)
-    public float surfaceOffset = 0.005f; // how far paint floats in front of the surface
-    public bool isEraser = false;
+    [Tooltip("A transparent URP/Unlit material (white). Used for all paint")]
+    public Material paintMaterial;
 
-    [Header("Haptics")]
-    public float proximityLookDistance = 3f;   // how far we look for a surface for the haptic distance
+    [Tooltip("Your cursor image (a UI Image). Optional")]
+    public RectTransform cursor;
 
-    [Header("Data logging")]
-    public DataLogger logger;                  // NEW: drag the DataLogger here (empty = no movement logging)
+    // ── Cursor ───────────────────────────────────────────────────────────────
+    [Header("Cursor")]
+    [Tooltip("ON = aim wherever you place your cursor image. OFF = use Cursor Screen Position below")]
+    public bool aimAtCursorImage = true;
 
-    [Header("Aim point on screen (0-1). Match your cursor.")]
-    // x 0.5 = centre, y 0.7 = upper third. Cursor Pos Y = (y - 0.5) * 1920 = 384
-    public Vector2 aimViewport = new Vector2(0.5f, 0.7f);
+    [Tooltip("Only used without a cursor image (or with the option above OFF). X: 0 left … 1 right, Y: 0 bottom … 1 top")]
+    public Vector2 cursorScreenPosition = new Vector2(0.5f, 0.67f);
 
-    readonly List<GameObject> dots = new List<GameObject>();
+    // ── Paint ────────────────────────────────────────────────────────────────
+    [Header("Paint")]
+    [Tooltip("Colour used at the start (colour buttons change it)")]
+    public Color paintColor = new Color(1f, 0.15f, 0.15f, 1f);
 
-    // NEW: what each dot is (same order as 'dots'), for final_paint.csv
-    public struct DotRecord
-    {
-        public Vector3 position, normal;
-        public Color color;
-        public float size;
-        public int strokeId;
-        public float paintedAt;   // Time.realtimeSinceStartup when painted
-    }
-    readonly List<DotRecord> dotRecords = new List<DotRecord>();
-    readonly Dictionary<Color, Material> materials = new Dictionary<Color, Material>();
-    Transform dotParent;
-    Texture2D dotTexture;
-    Vector3? lastPoint;
-    bool wasPressing;   // was the finger down in the last frame?
-    int strokeId;       // NEW: +1 for every new stroke → newer strokes are drawn ON TOP
-    float aimDistance = -1f;
+    [Tooltip("Brush width in metres — the same at every distance")]
+    public float brushSize = 0.03f;
 
+    [Tooltip("0 = hard edge, 1 = very soft edge")]
+    [Range(0f, 1f)] public float brushSoftness = 0.15f;
+
+    [Tooltip("Paint only reaches surfaces closer than this (metres)")]
+    public float paintRange = 1.5f;
+
+    [Tooltip("Gap between dots in a line, as a part of the brush width (smaller = smoother line)")]
+    public float dotSpacing = 0.3f;
+
+    [Tooltip("If the aim point jumps farther than this in one frame, the line is not connected (metres)")]
+    public float maxJump = 0.25f;
+
+    [Tooltip("Safety limit: above this many dots, the oldest are removed")]
+    public int maxDots = 6000;
+
+    // ── Eraser ───────────────────────────────────────────────────────────────
+    [Header("Eraser")]
+    [Tooltip("Eraser width in metres")]
+    public float eraserSize = 0.08f;
+
+    // ── Values other scripts can read (haptics later) ───────────────────────
+    [HideInInspector] public bool isSpraying;           // finger on screen (set by SprayButton)
+    public bool IsEraser { get; private set; }          // true = eraser selected
+    public bool HasTarget { get; private set; }         // cursor points at a scanned surface
+    public bool InRange { get; private set; }           // …and it is close enough
+    public float TargetDistance { get; private set; }   // metres to the surface (-1 = none)
+    public bool IsPainting => isSpraying && InRange;    // painting/erasing right now
+
+    // ── Internal ─────────────────────────────────────────────────────────────
+    Texture2D dotTexture;                                                  // the round dot image
+    readonly Dictionary<Color, Material> materials = new Dictionary<Color, Material>(); // one material per colour
+    Transform paintRoot;                                                   // parent of all dots
+    readonly List<Transform> dots = new List<Transform>();                 // all dots, oldest first
+    bool hasLastPoint;                                                     // is a line in progress?
+    Vector3 lastPoint;                                                     // where the line got to
+
+
+    // Start() runs ONCE, when the app starts.
     void Start()
     {
         if (arCamera == null) arCamera = Camera.main;
-        dotParent = new GameObject("PaintDots").transform;
-        dotTexture = MakeRoundTexture(64);
-        HapticsBridge.Start();
+        dotTexture = MakeDot(64, brushSoftness);
+        paintRoot = new GameObject("Paint").transform;
+
+        if (!aimAtCursorImage) PlaceCursor();   // don't move YOUR cursor if you placed it yourself
     }
 
+
+    // Moves the cursor image to Cursor Screen Position (only when aimAtCursorImage is OFF)
+    void PlaceCursor()
+    {
+        if (cursor == null) return;
+        cursor.anchorMin = cursorScreenPosition;
+        cursor.anchorMax = cursorScreenPosition;
+        cursor.anchoredPosition = Vector2.zero;
+    }
+
+
+    // Where on the screen we aim (0–1). Follows your cursor image if you placed one.
+    Vector2 AimPoint()
+    {
+        if (aimAtCursorImage && cursor != null)
+        {
+            // Your cursor's position in screen pixels…
+            Vector2 screen = RectTransformUtility.WorldToScreenPoint(null, cursor.position);
+            // …turned into 0–1 (divide by the screen size)
+            return new Vector2(screen.x / Screen.width, screen.y / Screen.height);
+        }
+        return cursorScreenPosition;   // no image → use the number
+    }
+
+
+    // Update() runs EVERY FRAME (about 60 times per second).
     void Update()
     {
-        // NEW: one aim ray per frame, used for BOTH the haptic distance and painting
-        Ray ray = arCamera.ViewportPointToRay(aimViewport);
-        bool hasSurface = Physics.Raycast(ray, out RaycastHit hit, proximityLookDistance);
-        bool canPaint = hasSurface && hit.distance <= maxDistance;   // same check as painting below
-        aimDistance = hasSurface ? hit.distance : -1f;
-        SendHapticDistance(hasSurface, canPaint, hit);
+        // 1. AIM: a ray from the camera through the cursor's point on the screen
+        Vector2 aim = AimPoint();
+        Ray ray = arCamera.ViewportPointToRay(new Vector3(aim.x, aim.y, 0f));
+        HasTarget = Physics.Raycast(ray, out RaycastHit hit, 20f);
+        TargetDistance = HasTarget ? hit.distance : -1f;
+        InRange = HasTarget && hit.distance <= paintRange;
 
-        bool pressing = IsPressing();
-
-        if (pressing && !wasPressing) HapticsBridge.Press();     // finger just went down
-        if (!pressing && wasPressing) HapticsBridge.Release();   // finger just came up
-        wasPressing = pressing;
-
-        if (logger != null) logger.SetState(pressing, canPaint, aimDistance);   // NEW: for movement.csv
-
-        if (!pressing) { lastPoint = null; return; }
-
-        if (!hasSurface || hit.distance > maxDistance)
+        // 2. Nothing to do if the finger is up or the surface is too far
+        if (!isSpraying || !InRange)
         {
-            status = hasSurface
-                ? $"Surface found but too far: {hit.distance:F2} m (max {maxDistance} m)"
-                : "Touch OK, but the aim ray hits NO surface";
-            lastPoint = null;
+            hasLastPoint = false;   // the next touch starts a new line
             return;
         }
-        status = $"Painting on '{hit.collider.name}' at {hit.distance:F2} m";
 
-        if (isEraser) { Erase(hit.point); return; }
-
-        Vector3 p = hit.point + hit.normal * surfaceOffset; // lift slightly off the surface
-
-        if (lastPoint == null)
+        // 3. First point of a line, or the aim jumped far → just one dot here
+        if (!hasLastPoint || Vector3.Distance(lastPoint, hit.point) > maxJump)
         {
-            strokeId++;                 // NEW: a new stroke starts → it goes on top of all older ones
-            PlaceDot(p, hit.normal);
+            ApplyAt(hit.point, hit.normal);
+            lastPoint = hit.point;
+            hasLastPoint = true;
+            return;
         }
-        else
-        {
-            float dist = Vector3.Distance(lastPoint.Value, p);
-            if (dist < dotSpacing) return;
 
-            if (dist > maxStrokeGap)
-            {
-                PlaceDot(p, hit.normal); // big jump (e.g. to another surface): don't draw a line through the air
-            }
-            else
-            {
-                int steps = Mathf.CeilToInt(dist / dotSpacing);
-                for (int i = 1; i <= steps; i++)
-                    PlaceDot(Vector3.Lerp(lastPoint.Value, p, (float)i / steps), hit.normal);
-            }
+        // 4. Continue the line: fill the gap from the last point to here with evenly spaced dots
+        float step = (IsEraser ? eraserSize : brushSize) * dotSpacing;
+        float length = Vector3.Distance(lastPoint, hit.point);
+        if (length < step) return;                                // hasn't moved enough yet
+
+        int count = Mathf.FloorToInt(length / step);
+        Vector3 direction = (hit.point - lastPoint) / length;
+        for (int i = 1; i <= count; i++)
+        {
+            ApplyAt(lastPoint + direction * step * i, hit.normal);
         }
-        lastPoint = p;
+        lastPoint += direction * step * count;
     }
 
-    // NEW: when the session ends the painter is switched off → close the nozzle if a finger is still down.
-    void OnDisable()
+
+    // Paint or erase at one point, depending on the selected tool
+    void ApplyAt(Vector3 point, Vector3 normal)
     {
-        if (wasPressing) { HapticsBridge.Release(); wasPressing = false; }
-        lastPoint = null;
+        if (IsEraser) EraseAt(point);
+        else PaintAt(point, normal);
     }
 
-    // Tell the haptics plugin (1) CAN I PAINT here, and (2) how far the surface is.
-    // CAN PAINT uses the SAME check as painting below, so haptic and paint always agree.
-    // No surface = "far" (proximityLookDistance). AR tracking lost = -1 (plugin keeps the last value).
-    void SendHapticDistance(bool hasSurface, bool canPaint, RaycastHit hit)
-    {
-        HapticsBridge.SetCanPaint(canPaint);
 
-        if (ARSession.state != ARSessionState.SessionTracking)
-            HapticsBridge.SetDistance(-1f);
-        else
-            HapticsBridge.SetDistance(hasSurface ? hit.distance : proximityLookDistance);
-    }
-
-    bool IsPressing()
-    {
-        bool pressed =
-            (Touchscreen.current != null && Touchscreen.current.primaryTouch.press.isPressed) ||
-            (Mouse.current != null && Mouse.current.leftButton.isPressed);
-        if (!pressed)
-        {
-            status = Touchscreen.current == null && Mouse.current == null
-                ? "No touchscreen found (check Active Input Handling)"
-                : "Not touching";
-            return false;
-        }
-
-        // Finger is on a UI button -> don't paint
-        if (EventSystem.current != null && EventSystem.current.IsPointerOverGameObject())
-        {
-            status = "Touch is on UI -> not painting";
-            return false;
-        }
-        return true;
-    }
-
-    // ---------- Debug text on screen (turn off with Show Debug) ----------
-
-    [Header("Debug")]
-    public bool showDebug = true;
-    string status = "Starting...";
-    int meshCount;
-    float nextMeshCheck;
-
-    void OnGUI()
-    {
-        if (!showDebug) return;
-
-        if (Time.time > nextMeshCheck)
-        {
-            meshCount = FindObjectsByType<MeshCollider>(FindObjectsSortMode.None).Length;
-            nextMeshCheck = Time.time + 1f;
-        }
-
-        var style = new GUIStyle(GUI.skin.label) { fontSize = 40 };
-        style.normal.textColor = Color.yellow;
-        // CHANGED: moved down to 45 % of the screen, because the haptics debugger is now at the top
-        GUI.Label(new Rect(40, Screen.height * 0.45f, Screen.width - 80, 400),
-            $"{status}\nScanned mesh pieces: {meshCount}\nDots: {dots.Count}", style);
-    }
-
-    void PlaceDot(Vector3 pos, Vector3 normal)
+    // Puts one paint dot flat on the surface
+    void PaintAt(Vector3 point, Vector3 normal)
     {
         GameObject dot = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        Destroy(dot.GetComponent<Collider>()); // dots must not block the aim ray
-        dot.name = "Dot";
-        dot.transform.SetParent(dotParent);
-        dot.transform.position = pos;
-        dot.transform.rotation = Quaternion.LookRotation(-normal); // face out of the surface
-        dot.transform.localScale = Vector3.one * brushSize;
-        var rend = dot.GetComponent<Renderer>();
-        rend.sharedMaterial = GetMaterial(paintColor);
-        rend.sortingOrder = Mathf.Min(strokeId, 32767);   // NEW: newer stroke = higher number = drawn on top
-        dots.Add(dot);
-        dotRecords.Add(new DotRecord {                     // NEW: remember it for final_paint.csv
-            position = pos, normal = normal, color = paintColor, size = brushSize,
-            strokeId = strokeId, paintedAt = Time.realtimeSinceStartup });
+        DestroyImmediate(dot.GetComponent<Collider>());   // the aim must not hit the paint itself
+        dot.name = "PaintDot";
+
+        Transform t = dot.transform;
+        t.SetParent(paintRoot, true);
+        t.position = point + normal * 0.002f;             // 2 mm above the surface
+        t.rotation = Quaternion.LookRotation(-normal)     // lie flat on the surface
+                   * Quaternion.Euler(0f, 0f, Random.Range(0f, 360f));
+        t.localScale = Vector3.one * brushSize;            // same size at every distance
+
+        dot.GetComponent<MeshRenderer>().sharedMaterial = MaterialFor(paintColor);
+
+        dots.Add(t);
+        if (dots.Count > maxDots)                          // too many → remove the oldest
+        {
+            Destroy(dots[0].gameObject);
+            dots.RemoveAt(0);
+        }
     }
 
-    /// NEW: copy of every dot that is still there right now (the final painting).
-    public List<DotRecord> GetPaintSnapshot() => new List<DotRecord>(dotRecords);
 
-    void Erase(Vector3 point)
+    // Removes every dot that touches the eraser circle
+    void EraseAt(Vector3 point)
     {
-        float r = eraserSize * 0.5f;
-        for (int i = dots.Count - 1; i >= 0; i--)
+        float radius = (eraserSize + brushSize) * 0.5f;
+        float radiusSquared = radius * radius;
+        for (int i = dots.Count - 1; i >= 0; i--)          // backwards, because we remove while looping
         {
-            if ((dots[i].transform.position - point).sqrMagnitude < r * r)
+            if ((dots[i].position - point).sqrMagnitude <= radiusSquared)
             {
-                Destroy(dots[i]);
+                Destroy(dots[i].gameObject);
                 dots.RemoveAt(i);
-                dotRecords.RemoveAt(i);   // NEW: keep the records in sync
             }
         }
     }
 
-    Material GetMaterial(Color c)
+
+    // One material per colour (made the first time a colour is used)
+    Material MaterialFor(Color c)
     {
         if (!materials.TryGetValue(c, out Material m))
         {
             m = new Material(paintMaterial);
-            m.SetColor("_BaseColor", c);
-            m.SetTexture("_BaseMap", dotTexture);
-            // NEW: draw dots in the transparent pass without depth writing, so the
-            // drawing ORDER decides what is on top (newest stroke wins, see sortingOrder).
-            // Real walls still hide the paint (the occlusion mesh is drawn before).
-            m.renderQueue = 3000;
-            m.SetFloat("_ZWrite", 0f);
+            m.mainTexture = dotTexture;
+            m.color = c;
             materials[c] = m;
         }
         return m;
     }
 
-    Texture2D MakeRoundTexture(int size)
+
+    // ── Called by the buttons ────────────────────────────────────────────────
+    public void SelectColor(Color c)
+    {
+        paintColor = c;
+        IsEraser = false;
+    }
+
+    public void SelectEraser()
+    {
+        IsEraser = true;
+    }
+
+    public void ClearPaint()
+    {
+        foreach (Transform t in dots) Destroy(t.gameObject);
+        dots.Clear();
+    }
+
+
+    // Makes a round white dot. softness 0 = hard edge, 1 = fades from the centre.
+    static Texture2D MakeDot(int size, float softness)
     {
         var tex = new Texture2D(size, size, TextureFormat.RGBA32, false);
+        tex.wrapMode = TextureWrapMode.Clamp;
         float c = (size - 1) / 2f;
         for (int y = 0; y < size; y++)
+        {
             for (int x = 0; x < size; x++)
             {
-                float d = Vector2.Distance(new Vector2(x, y), new Vector2(c, c)) / c;
-                float a = Mathf.Clamp01((1f - d) * 8f); // solid circle with a soft edge
-                tex.SetPixel(x, y, new Color(1, 1, 1, a));
+                float d = Mathf.Sqrt((x - c) * (x - c) + (y - c) * (y - c)) / c;   // 0 centre … 1 edge
+                float a = softness <= 0.01f
+                        ? (d <= 1f ? 1f : 0f)
+                        : Mathf.Clamp01((1f - d) / softness);
+                a = a * a * (3f - 2f * a);                                           // smooth
+                tex.SetPixel(x, y, new Color(1f, 1f, 1f, a));
             }
+        }
         tex.Apply();
         return tex;
-    }
-
-    // ---------- Called from UI Buttons (OnClick) ----------
-
-    // Type a hex colour in the button's OnClick box, e.g. #FF0000
-    public void SetColorHex(string hex)
-    {
-        if (ColorUtility.TryParseHtmlString(hex, out Color c)) paintColor = c;
-        isEraser = false;
-    }
-
-    public void SetEraser() { isEraser = true; }
-
-    // Connect a UI Slider here (On Value Changed -> Dynamic float). Value in metres.
-    public void SetBrushSize(float size)
-    {
-        brushSize = size;
-        eraserSize = size * 2.5f; // eraser grows with the brush
-    }
-
-    public void ClearAll()
-    {
-        foreach (var d in dots) Destroy(d);
-        dots.Clear();
-        dotRecords.Clear();
-        strokeId = 0;      // next participant starts from stroke 1
     }
 }
